@@ -1,0 +1,8 @@
+pyyaml
+msgspec
+requests
+protobuf
+numpy==1.26
+transformers
+decorator
+scipy

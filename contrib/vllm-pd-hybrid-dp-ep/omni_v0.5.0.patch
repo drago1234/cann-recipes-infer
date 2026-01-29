@@ -1,0 +1,625 @@
+diff --git a/infer_engines/bash_install_code.sh b/infer_engines/bash_install_code.sh
+index 0f032435..1d561254 100644
+--- a/infer_engines/bash_install_code.sh
++++ b/infer_engines/bash_install_code.sh
+@@ -23,3 +23,4 @@ git apply --whitespace=nowarn $PATCH_ROOT/scheduler_abort_kv_loading_failure_req
+ git apply --whitespace=nowarn $PATCH_ROOT/tfas_patch_request.patch
+ git apply --whitespace=nowarn $PATCH_ROOT/prometheus_dp_logging.patch
+ git apply --whitespace=nowarn $PATCH_ROOT/swap_kv_cache.patch
++git apply --whitespace=nowarn $PATCH_ROOT/a2_pd_hybrid.patch
+diff --git a/omni/adaptors/vllm/patches/a2_pd_hybrid.patch b/omni/adaptors/vllm/patches/a2_pd_hybrid.patch
+new file mode 100644
+index 00000000..088eac4f
+--- /dev/null
++++ b/omni/adaptors/vllm/patches/a2_pd_hybrid.patch
+@@ -0,0 +1,104 @@
++diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
++index c0314e316..a15138c49 100644
++--- a/vllm/v1/core/sched/scheduler.py
+++++ b/vllm/v1/core/sched/scheduler.py
++@@ -40,6 +40,9 @@ import os
++ reuse_prefilled_tokens = os.getenv("OMNI_REUSE_PREFILLED_TOKENS", "0") == "1"
++ FORCE_ENABLE_CHUNK_PREFILL = os.getenv("FORCE_ENABLE_CHUNK_PREFILL", "0") == "1"
++ 
+++SEPARATE_PREFILL_DECODE = os.getenv("OMNI_PD_HYBRID", "0") == "1"
+++assert not (SEPARATE_PREFILL_DECODE and FORCE_ENABLE_CHUNK_PREFILL), "SEPARATE_PREFILL_DECODE and FORCE_ENABLE_CHUNK_PREFILL cannot be both enabled"
+++
++ class PreemptionMode(enum.Enum):
++     SWAP = enum.auto()
++     RECOMPUTE = enum.auto()
++@@ -221,9 +224,11 @@ class Scheduler(SchedulerInterface):
++         # For logging.
++         scheduled_timestamp = time.monotonic()
++ 
+++        should_skip_running = SEPARATE_PREFILL_DECODE and len(self.waiting) > 0
+++
++         # First, schedule the RUNNING requests.
++         req_index = 0
++-        while req_index < len(self.running) and token_budget > 0:
+++        while req_index < len(self.running) and token_budget > 0 and not should_skip_running:
++             request = self.running[req_index]
++ 
++             num_new_tokens = (request.num_tokens_with_spec -
++@@ -1141,3 +1146,6 @@ class Scheduler(SchedulerInterface):
++                 )
++             )
++ 
+++    def has_prefill_requests(self) -> bool:
+++        """Returns True if there are any waiting or running prefill requests (including chunked prefill)."""
+++        return len(self.waiting) > 0
++diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
++index a9e9369c0..e2dbc1647 100644
++--- a/vllm/v1/engine/async_llm.py
+++++ b/vllm/v1/engine/async_llm.py
++@@ -38,6 +38,7 @@ from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
++ from vllm.v1.metrics.stats import IterationStats
++ import os
++ reuse_prefilled_tokens = os.getenv("OMNI_REUSE_PREFILLED_TOKENS", "0") == "1"
+++single_api_server = os.getenv("OMNI_PD_HYBRID", "0") == "1"
++ 
++ logger = init_logger(__name__)
++ 
++@@ -108,11 +109,12 @@ class AsyncLLM(EngineClient):
++         self.output_processor = OutputProcessor(self.tokenizer,
++                                                 log_stats=self.log_stats)
++ 
++-        # # EngineCore (starts the engine in background process).
+++        # EngineCore (starts the engine in background process).
++         # core_client_class = AsyncMPClient if (
++         #     vllm_config.parallel_config.data_parallel_size
++         #     == 1) else DPAsyncMPClient
++-        core_client_class = AsyncMPClient # use AsyncMPClient only. a workaround for manual api-server scaleout
+++
+++        core_client_class = DPAsyncMPClient if single_api_server else AsyncMPClient # use AsyncMPClient for manual api-server scaleout, DPAsyncMPClient for single api-server
++ 
++         self.engine_core = core_client_class(
++             vllm_config=vllm_config,
++diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
++index 4f3eb9428..5600a3b64 100644
++--- a/vllm/v1/engine/core.py
+++++ b/vllm/v1/engine/core.py
++@@ -423,8 +423,8 @@ class EngineCore:
++     def is_sleeping(self) -> bool:
++         return self.model_executor.is_sleeping
++ 
++-    def execute_dummy_batch(self):
++-        self.model_executor.collective_rpc("execute_dummy_batch")
+++    def execute_dummy_batch(self, phase: str = "decode"):
+++        self.model_executor.collective_rpc("execute_dummy_batch", args=(phase, ))
++ 
++     def add_lora(self, lora_request: LoRARequest) -> bool:
++         return self.model_executor.add_lora(lora_request)
++@@ -854,11 +854,26 @@ class DPEngineCoreProc(EngineCoreProc):
++         super().__init__(vllm_config, on_head_node, input_address,
++                          executor_class, log_stats, dp_rank)
++ 
++-        self.enable_sleep_mode = bool(int(os.getenv("VLLM_ENABLE_SLEEP_MODE", '0')))
+++        self.enable_sleep_mode = bool(int(os.getenv("VLLM_ENABLE_SLEEP_MODE", '0'))) or bool(int(os.getenv("OMNI_PD_HYBRID", "0")))
++         if not self.enable_sleep_mode:
++             # initialized with True, a workaround for manual api-server scaleout
++             self.engines_running = True
++ 
+++    def _get_global_phase_hint(self) -> str:
+++        """Obtain the global status of prefill/decode through DP all-reduce.
+++        Prefill takes priority—if any process is in prefill, return prefill; otherwise, return decode."""
+++        try:
+++            has_prefill_local = self.scheduler.has_prefill_requests()
+++        except AttributeError:
+++            logger.warning("Cannot determine local prefill status, fallback to decode phase.")
+++            return "decode"
+++
+++        global_has_prefill = ParallelConfig.has_unfinished_dp(self.dp_group, has_prefill_local)
+++
+++        if global_has_prefill:
+++            return "prefill"
+++        return "decode"
+++
++     def _init_data_parallel(self, vllm_config: VllmConfig):
++ 
++         # Configure GPUs and stateless process group for data parallel.
+diff --git a/omni/adaptors/vllm/patches/model_patch.py b/omni/adaptors/vllm/patches/model_patch.py
+index cefe22d6..691f5a59 100644
+--- a/omni/adaptors/vllm/patches/model_patch.py
++++ b/omni/adaptors/vllm/patches/model_patch.py
+@@ -50,6 +50,59 @@ def patch_linear():
+     from omni.models.common.layers.linear import AscendUnquantizedLinearMethod
+     linear.UnquantizedLinearMethod = AscendUnquantizedLinearMethod
+ 
++def patch_engine_core_proc():
++    if os.getenv("OMNI_PD_HYBRID", "0") == "0":
++        return
++
++    from vllm.v1.engine import EngineCoreOutputs
++    from vllm.v1.engine.core import DPEngineCoreProc
++
++    def custom_run_busy_loop(self):
++        """Core busy loop of the EngineCore for data parallel case."""
++        from vllm.logger import logger
++
++        while True:
++            self._process_input_queue()
++
++            phase = self._get_global_phase_hint()
++
++            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
++
++            if phase == "prefill":
++                has_prefill_local = self.scheduler.has_prefill_requests()
++                if has_prefill_local:
++                    self._process_engine_step()
++                else:
++                    self.execute_dummy_batch("prefill")
++            else:
++                if local_unfinished_reqs:
++                    self._process_engine_step()
++                else:
++                    if self.scheduler.has_finished_requests():
++                        self._process_engine_step()
++                    else:
++                        self.execute_dummy_batch("decode")
++
++            local_unfinished_reqs = self.scheduler.has_unfinished_requests() or self.scheduler.has_finished_requests()
++
++            if not self.enable_sleep_mode:
++                # disable all-reduce operation, a workaround for manual api-server scale-out
++                continue
++
++            # 3) All-reduce operation to determine global unfinished reqs.
++            self.engines_running = self._has_global_unfinished_reqs(
++                local_unfinished_reqs)
++
++            if not self.engines_running:
++                if self.dp_rank == 0:
++                    # Notify client that we are pausing the loop.
++                    logger.debug("Wave %d finished, pausing engine loop.",
++                                 self.current_wave)
++                    self.output_queue.put_nowait(
++                        EngineCoreOutputs(wave_complete=self.current_wave))
++                self.current_wave += 1
++    DPEngineCoreProc.run_busy_loop = custom_run_busy_loop
++
+ _patch_done = False
+ 
+ def patch_all():
+@@ -63,6 +116,7 @@ def patch_all():
+     patch_compilation()
+     patch_pangu()
+     patch_linear()
++    patch_engine_core_proc()
+     _patch_done = True
+ 
+ patch_all() 
+diff --git a/omni/adaptors/vllm/worker/npu_model_runner.py b/omni/adaptors/vllm/worker/npu_model_runner.py
+index f960dfb5..10093b22 100644
+--- a/omni/adaptors/vllm/worker/npu_model_runner.py
++++ b/omni/adaptors/vllm/worker/npu_model_runner.py
+@@ -772,7 +772,7 @@ class NPUModelRunner(GPUModelRunner):
+         )
+ 
+     @torch.inference_mode()
+-    def _dummy_run(self, num_tokens: int, is_capture_model: bool = False) -> torch.Tensor:
++    def _dummy_run(self, num_tokens: int, is_capture_model: bool = False, phase: str = "decode") -> torch.Tensor:
+         if self.is_multimodal_model:
+             input_ids, inputs_embeds = None, self.inputs_embeds[:num_tokens]
+         else:
+@@ -791,6 +791,46 @@ class NPUModelRunner(GPUModelRunner):
+ 
+         positions = self.mrope_positions[:, :num_tokens] if self.uses_mrope else self.positions[:num_tokens]
+         raw_hidden_states = None
++        if phase == "prefill": # dummy pefill run
++            global_batch = num_tokens
++            tp_pad = _get_pad_size(global_batch)
++
++            fake_len = global_batch + tp_pad
++            if self.is_multimodal_model:
++                inputs_embeds = (self.inputs_embeds[:fake_len]
++                                 if self.inputs_embeds.shape[0] >= fake_len
++                                 else torch.zeros(fake_len, *self.inputs_embeds.shape[1:],
++                                                 dtype=self.inputs_embeds.dtype, device=self.device))
++                input_ids = None
++            else:
++                input_ids = torch.zeros(fake_len, dtype=self.input_ids.dtype, device=self.device)
++                inputs_embeds = None
++            positions = torch.zeros(fake_len, dtype=self.positions.dtype, device=self.device)
++
++            self.attn_state = AscendAttentionState.PrefillNoCache
++            with set_forward_context(None, self.vllm_config):
++                forward_results = self.model(
++                    input_ids=input_ids,
++                    positions=positions,
++                    intermediate_tensors=intermediate_tensors,
++                    inputs_embeds=inputs_embeds,
++                )
++                if isinstance(forward_results, tuple):
++                    raw_hidden_states, hidden_states = forward_results
++                else:
++                    hidden_states = forward_results
++                    raw_hidden_states = forward_results
++                if self.use_spec_decode:
++                    self.drafter.propose(
++                        num_tokens=fake_len,
++                        positions=positions,
++                        kv_caches=None,
++                        attn_metadata=None,
++                        previous_hidden_states=raw_hidden_states,
++                        last_accepted_index=None,
++                        sample_indices=None,
++                    )
++            return hidden_states
+ 
+         # No kv_caches: profile run
+         if not self.kv_caches:
+diff --git a/omni/adaptors/vllm/worker/npu_worker.py b/omni/adaptors/vllm/worker/npu_worker.py
+index 66235c5a..83c8c2a7 100644
+--- a/omni/adaptors/vllm/worker/npu_worker.py
++++ b/omni/adaptors/vllm/worker/npu_worker.py
+@@ -332,8 +332,8 @@ class NPUWorker(WorkerBase):
+             self.profiler.start()
+         else:
+             self.profiler.stop()
+-    def execute_dummy_batch(self) -> None:
+-        self.model_runner._dummy_run(1)
++    def execute_dummy_batch(self, phase: str = "decode") -> None:
++        self.model_runner._dummy_run(1, phase=phase)
+         if model_extra_config.operator_opt_config.use_omni_placement:
+             self.model_runner.planner.place_experts()
+     def add_lora(self, lora_request: LoRARequest) -> bool:
+diff --git a/omni/models/common/layers/vocab_parallel_embedding.py b/omni/models/common/layers/vocab_parallel_embedding.py
+index 7952a91b..537937e8 100644
+--- a/omni/models/common/layers/vocab_parallel_embedding.py
++++ b/omni/models/common/layers/vocab_parallel_embedding.py
+@@ -197,6 +197,7 @@ class ParallelLMHead(VocabParallelEmbedding):
+                  quant_config: Optional[QuantizationConfig] = None,
+                  prefix: str = "",
+                  parallel_lmhead: bool = True):
++        self.parallel_lmhead = parallel_lmhead
+         super().__init__(num_embeddings, embedding_dim, params_dtype,
+                          org_num_embeddings, padding_size, quant_config,
+                          prefix, parallel_lmhead)
+@@ -213,14 +214,14 @@ class ParallelLMHead(VocabParallelEmbedding):
+             self.register_parameter("bias", None)
+ 
+     def forward(self, hidden_states, embedding_bias):
+-        if model_extra_config.parall_config.dp_size > 1:
++        if model_extra_config.parall_config.dp_size > 1 and self.parallel_lmhead:
+             hidden_states = get_local_world_group().all_gather(hidden_states, dim=0)
+ 
+         logits = self.quant_method.apply(self,
+                                          hidden_states,
+                                          bias=embedding_bias)
+ 
+-        if model_extra_config.parall_config.dp_size > 1:
++        if model_extra_config.parall_config.dp_size > 1 and self.parallel_lmhead:
+             logits = get_local_world_group().all_to_all(logits)
+         else:
+             logits = tensor_model_parallel_all_gather(logits)
+diff --git a/omni/models/deepseek/deepseek_v3.py b/omni/models/deepseek/deepseek_v3.py
+index 85e4666b..1a514a7d 100644
+--- a/omni/models/deepseek/deepseek_v3.py
++++ b/omni/models/deepseek/deepseek_v3.py
+@@ -238,7 +238,7 @@ class DeepseekDecoderLayer(nn.Module):
+         # hidden : tokens * 7168
+ 
+         # Perform full hidden splitting to avoid OOM
+-        if model_extra_config.parall_config.dp_size > 1 and attn_metadata is None:
++        if model_extra_config.parall_config.dp_size > 1 and is_prefill:
+             reduce_length = torch.tensor(hidden_states.shape[0], dtype=torch.int64, device=current_platform.device_type)
+             local_length = hidden_states.shape[0]
+             # global_max_length = torch.tensor(0, dtype=torch.int64)
+diff --git a/omni/models/deepseek/deepseek_v3_a2.py b/omni/models/deepseek/deepseek_v3_a2.py
+index dfbd1837..f9727c10 100644
+--- a/omni/models/deepseek/deepseek_v3_a2.py
++++ b/omni/models/deepseek/deepseek_v3_a2.py
+@@ -418,12 +418,14 @@ class DeepseekV3Model(nn.Module):
+ 
+         self.padding_idx = config.pad_token_id
+         self.vocab_size = config.vocab_size
++        parallel_lmhead = model_extra_config.parall_config.dp_size > 1 and os.getenv("OMNI_PD_HYBRID", "0") == "0"
++        self.embed_reduce = 1 if parallel_lmhead else 0
+ 
+         if get_pp_group().is_first_rank:
+             self.embed_tokens = VocabParallelEmbedding(
+                 config.vocab_size,
+                 config.hidden_size,
+-                parallel_lmhead=(model_extra_config.parall_config.dp_size > 1),
++                parallel_lmhead=parallel_lmhead,
+             )
+         else:
+             self.embed_tokens = PPMissingLayer()
+@@ -460,7 +462,7 @@ class DeepseekV3Model(nn.Module):
+     CACHED_GLOBAL_NUM_TOKENS = None
+ 
+     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+-        return self.embed_tokens(input_ids, reduce=1)
++        return self.embed_tokens(input_ids, reduce=self.embed_reduce)
+ 
+     def forward(
+             self,
+@@ -524,10 +526,11 @@ class DeepseekV3ForCausalLM(nn.Module):
+         self.config = vllm_config.model_config.hf_config
+         self.quant_config = vllm_config.quant_config
+         self.model = DeepseekV3Model(vllm_config=vllm_config, prefix="model")
++        parallel_lmhead = model_extra_config.parall_config.dp_size > 1 and os.getenv("OMNI_PD_HYBRID", "0") == "0"
+         self.lm_head = ParallelLMHead(self.config.vocab_size,
+                                       self.config.hidden_size,
+                                       quant_config=self.quant_config,
+-                                      parallel_lmhead=(model_extra_config.parall_config.dp_size > 1))
++                                      parallel_lmhead=parallel_lmhead)
+         self.logits_processor = LogitsProcessor(self.config.vocab_size,
+                                                 logits_as_input=True)
+         self.sampler = Sampler()
+diff --git a/omni/models/qwen/fused_moe/layer.py b/omni/models/qwen/fused_moe/layer.py
+index b8a88a23..b1f76514 100644
+--- a/omni/models/qwen/fused_moe/layer.py
++++ b/omni/models/qwen/fused_moe/layer.py
+@@ -13,6 +13,7 @@ from vllm.distributed import get_tp_group, get_dp_group, get_ep_group
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+ from vllm.model_executor.utils import set_weight_attrs
++from omni.adaptors.vllm.distributed.communication_op import all_gather_two_stage
+ 
+ import os
+ 
+@@ -267,15 +268,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
+         if is_prefill:
+             assert len(x.shape) == 2
+             assert len(router_logits.shape) == 2
+-            n_tokens = x.shape[0]
+-            n_tokens_tensor = torch.Tensor([n_tokens]).int().npu()
+-            n_tokens_list = get_ep_group().all_gather(n_tokens_tensor, dim=0).tolist()
+-            x_output_list = [torch.empty((n, x.shape[1]), dtype=x.dtype, device=x.device) for n in n_tokens_list]
+-            router_logits_output_list = [torch.empty((n, router_logits.shape[1]), dtype=router_logits.dtype, device=router_logits.device) for n in n_tokens_list]
+-            get_ep_group().all_gather_v(x_output_list, x)
+-            get_ep_group().all_gather_v(router_logits_output_list, router_logits)
+-            x = torch.cat(x_output_list)
+-            router_logits = torch.cat(router_logits_output_list)
++            x = all_gather_two_stage(x, idx=0, dim=0)
++            router_logits = all_gather_two_stage(router_logits, idx=0, dim=0)
+         else:
+             return self.apply_all2all_decode(
+                 layer,
+@@ -365,14 +359,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
+             topk_ids,
+         ).to(x.dtype)
+ 
+-        if is_prefill:
+-            assert len(y.shape) == 2
+-            y_list = list(torch.split(y, n_tokens_list))
+-            y_output = torch.empty((n_tokens, y.shape[1]), dtype=y.dtype, device=y.device)
+-            get_ep_group().reduce_scatter_v(y_output, y_list)
+-            y = y_output
+-        else:
+-            y = get_ep_group().reduce_scatter(y)
++        y = get_ep_group().reduce_scatter(y)
+ 
+         return y
+ 
+diff --git a/omni/models/qwen/qwen3_moe.py b/omni/models/qwen/qwen3_moe.py
+index 184bfe5c..08b42903 100644
+--- a/omni/models/qwen/qwen3_moe.py
++++ b/omni/models/qwen/qwen3_moe.py
+@@ -26,6 +26,7 @@ from typing import Any, Optional, Union, List, Tuple
+ 
+ import torch
+ from torch import nn
++import torch.distributed as dist
+ from transformers import PretrainedConfig
+ from vllm.attention import Attention, AttentionMetadata
+ from vllm.config import CacheConfig, VllmConfig
+@@ -54,10 +55,11 @@ from omni.models.common.layers.linear import (RowParallelFlashCommLinear,
+                                               QKVParallelFlashCommLinear)
+ from omni.models.common.layers.rotary_embedding import get_rope
+ from omni.models.common.layers.attention.backend.attention import AscendAttentionState
++from omni.models.common.config.model_config import model_extra_config
+ 
+ 
+ logger = init_logger(__name__)
+-SEQ_SPLIT_LENGTH = 4096
++SEQ_SPLIT_LENGTH = 256
+ 
+ class Qwen3MoeSparseMoeBlock(nn.Module):
+ 
+@@ -296,6 +298,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
+         is_prefill = attn_metadata is None or not attn_metadata.is_pd_seperate_d
+         if is_prefill:
+             local_length = hidden_states.shape[0]
++            if model_extra_config.parall_config.dp_size > 1:
++                reduce_length = torch.tensor(local_length, dtype=torch.int64, device="npu")
++                dist.all_reduce(reduce_length, op=dist.ReduceOp.MAX, async_op=False)
++                global_max_length = reduce_length.item()
++                pad_size = global_max_length - hidden_states.shape[0]
++                hidden_states = torch.nn.functional.pad(
++                    hidden_states, (0, 0, 0, pad_size)
++                )
+             hidden_states_list = hidden_states.split(SEQ_SPLIT_LENGTH)
+             hidden_states_out = []
+             for i in range(len(hidden_states_list)):
+diff --git a/tests/test_config/test_config_pd_hybrid_a2.json b/tests/test_config/test_config_pd_hybrid_a2.json
+new file mode 100644
+index 00000000..aa54b01b
+--- /dev/null
++++ b/tests/test_config/test_config_pd_hybrid_a2.json
+@@ -0,0 +1,26 @@
++{
++    "model_parallel_config": {
++        "dense_mlp_tp_size": 1,
++        "o_proj_tp_size": 1,
++        "dp_size": 32
++    },
++    "operator_optimizition_config": {
++        "enable_kv_rmsnorm_rope_cache": true,
++        "prefill_moe_all_to_all": false,
++        "moe_multi_stream_tune": false,
++        "best_ep": false,
++        "merge_qkv": false,
++        "two_stage_comm": true,
++        "gmm_nz": true,
++        "decode_moe_dispatch_combine": false,
++        "use_omni_placement": false,
++        "omni_placement_config_path": ".",
++        "opt_w2_scale_cast": false,
++        "enable_round_pipeline_comm": true,
++        "enable_pipeline_comm": false,
++        "pd_seperate_prefill": false,
++        "prefill_enable_long_seq": false,
++        "use_prefetch": false,
++        "prefill_enable_mla_alltoall_local": false
++    }
++}
+\ No newline at end of file
+diff --git a/tools/scripts/reinstall_vllm_omni.sh b/tools/scripts/reinstall_vllm_omni.sh
+new file mode 100644
+index 00000000..2bce866f
+--- /dev/null
++++ b/tools/scripts/reinstall_vllm_omni.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++
++current_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++infer_engines_path="$current_dir/../../infer_engines"
++
++if [ ! -d "$infer_engines_path" ]; then
++    echo "Error: infer_engines directory not found at $infer_engines_path"
++    exit 1
++fi
++
++cd "$infer_engines_path" || exit 1
++
++if [ ! -d "vllm" ]; then
++    echo "Error: vllm directory not found in $infer_engines_path"
++    exit 1
++fi
++
++git config --global --add safe.directory "$(realpath vllm)"
++
++cd vllm || return
++git checkout -f
++cd ..
++bash bash_install_code.sh
++
++pip uninstall vllm -y
++pip uninstall omni_infer -y
++
++cd vllm || return
++SETUPTOOLS_SCM_PRETEND_VERSION=0.9.0 VLLM_TARGET_DEVICE=empty pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e . --no-deps --no-build-isolation
++cd ../../
++
++pwd
++
++pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e . --no-deps --no-build-isolation
++
++pip uninstall numpy -y
++pip install -i https://pypi.tuna.tsinghua.edu.cn/simple numpy==1.26 --no-deps --no-build-isolation
+\ No newline at end of file
+diff --git a/tools/scripts/run_ds_w8a8_a2_hybrid.sh b/tools/scripts/run_ds_w8a8_a2_hybrid.sh
+new file mode 100644
+index 00000000..0752fdf9
+--- /dev/null
++++ b/tools/scripts/run_ds_w8a8_a2_hybrid.sh
+@@ -0,0 +1,105 @@
++#!/bin/bash
++
++set -ex
++
++# user setting
++# define four machines and master IP (can be specified by environment variables, default values are given)
++# master IP is the IP of the MACHINE1
++MACHINE1_HOSTNAME="${MACHINE1_HOSTNAME:-node1}"
++MACHINE2_HOSTNAME="${MACHINE2_HOSTNAME:-node2}"
++MACHINE3_HOSTNAME="${MACHINE3_HOSTNAME:-node3}"
++MACHINE4_HOSTNAME="${MACHINE4_HOSTNAME:-node4}"
++MASTER_IP="${MACHINE1_IP}"
++
++HCCL_IF_IP="${LOCAL_IP}"
++export HCCL_IF_IP
++
++export GLOO_SOCKET_IFNAME="bond1"
++export TP_SOCKET_IFNAME="bond1"
++
++MODEL_PATH="${MODEL_PATH:-/data/models/DeepSeek-R1-Quant-OmniInfer}"
++########################################################
++
++# node args (automatically determine data parallel start rank etc. based on hostname)
++case "$(hostname)" in
++  "$MACHINE1_HOSTNAME")
++    VLLM_ARGS=(
++    )
++    ;;
++  "$MACHINE2_HOSTNAME")
++    sleep 10
++    VLLM_ARGS=(
++      --data-parallel-start-rank 8
++      --headless
++    )
++    ;;
++  "$MACHINE3_HOSTNAME")
++    sleep 10
++    VLLM_ARGS=(
++      --data-parallel-start-rank 16
++      --headless
++    )
++    ;;
++  "$MACHINE4_HOSTNAME")
++    sleep 10
++    VLLM_ARGS=(
++      --data-parallel-start-rank 24
++      --headless
++    )
++    ;;
++  *)
++    echo "hostname '$(hostname)' is not in the predefined node list, please check the MACHINE*_HOSTNAME environment variable settings!"
++    exit 1
++    ;;
++esac
++
++export HCCL_BUFFSIZE=200
++export HCCL_CONNECT_TIMEOUT=600
++export HCCL_EXEC_TIMEOUT=120
++export ASCEND_GLOBAL_LOG_LEVEL=3
++
++export VLLM_USE_V1=1
++export VLLM_WORKER_MULTIPROC_METHOD=fork
++export OMNI_USE_DSV3=1
++export USING_LCCL_COM=0
++export VLLM_ENABLE_MC2=0
++
++MODEL_EXTRA_CFG_PATH="$(realpath ../../tests/test_config/test_config_pd_hybrid_a2.json)"
++export MODEL_EXTRA_CFG_PATH
++export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
++export HCCL_OP_EXPANSION_MODE="AIV"
++export ASCEND_PLATFORM="A2"
++
++ADDITIONAL_CONFIG='{"graph_model_compile_config": {"level":1}}'
++
++export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
++
++export ROLE="decode" # use for throw_dequant config
++export HCCL_INTRA_ROCE_ENABLE=1
++export HCCL_INTRA_PCIE_ENABLE=0
++
++export TNG_HOST_COPY=1
++export AUTO_USE_UC_MEMORY=1
++export TASK_QUEUE_ENABLE=2
++export ENABLE_OVERWRITE_REQ_IDS=1
++
++export OMNI_PD_HYBRID=1
++
++
++# use vllm cli
++vllm serve $MODEL_PATH \
++  --trust-remote-code \
++  --tensor-parallel-size 1 \
++  --enable-expert-parallel \
++  --data-parallel-size 32 \
++  --data-parallel-size-local 8 \
++  --data-parallel-address $MASTER_IP \
++  --data-parallel-rpc-port 9001 \
++  --disable-log-requests \
++  --gpu-memory-utilization 0.9 \
++  --max-num-seqs 32 \
++  --max-model-len 4096 \
++  --max-num-batched-tokens 4096 \
++  --no-enable-prefix-caching \
++  --additional-config "$ADDITIONAL_CONFIG" \
++  "${VLLM_ARGS[@]}"
+\ No newline at end of file

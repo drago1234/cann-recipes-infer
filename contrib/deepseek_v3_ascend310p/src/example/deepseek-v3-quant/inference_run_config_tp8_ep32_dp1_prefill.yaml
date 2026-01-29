@@ -1,0 +1,14 @@
+exe: cpp/build_out/mlguider_llm_ascend/main_inference
+serve_port: 12224
+model_path: /mnt/models1/zmh/tp8_ep32_quant_zn_codeD_v3_0324/DeepSeek-V3-0324-quantized-RTN/
+world_size: 32
+pipeline_parallel: 1
+tensor_parallel: 8
+expert_parallel: 32
+devices: [0,1,2,3,4,5,6,7,10,11,12,13,14,15,16,17,20,21,22,23,24,25,26,27,30,31,32,33,34,35,36,37]
+max_num_batched_tokens: 4096
+num_gpu_blocks: 64
+block_size: 256
+max_num_seqs: 16
+ratio: 0.8
+max_tokens: 128

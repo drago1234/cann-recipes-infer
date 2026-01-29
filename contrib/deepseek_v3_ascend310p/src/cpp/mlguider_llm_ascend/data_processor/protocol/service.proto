@@ -1,0 +1,73 @@
+// Copyright (c) 2025 QINGMAO INTELLIGENCE TECHNOLOGY (BEIJING) CO., LTD. and Huawei Technologies Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+syntax = "proto3";
+
+package miserve;
+
+// The service definition.
+service MIService {
+  rpc Prefill (PrefillRequest) returns (PrefillResponse) {}
+  rpc Generation (GenerationRequest) returns (GenerationResponse) {}
+  rpc Info (InfoRequest) returns (InfoResponse) {}
+}
+
+// The Prefill request message containing lists of input ids, position ids, and offset.
+message PrefillRequest {
+  repeated int32 inputids = 1;
+  repeated int32 positionids = 2;
+  repeated int32 block_tables = 3;
+  repeated int32 slot_mapping = 4;
+  repeated int32 seqlens_query = 5;
+  repeated int32 cu_seqlens_query = 6;
+  repeated int32 seqlens_kv = 7;
+  int32 max_seqlens_query = 8;
+  int32 max_seqlens_kv = 9;
+  int32 max_num_blocks_per_seq = 10;
+}
+
+// The Prefill response message containing a list of next tokens.
+message PrefillResponse {
+  repeated int32 next_tokens = 1;
+}
+
+// The Generation request message containing lists of seq lens, input ids, and position ids.
+message GenerationRequest {
+  repeated int32 inputids = 1;
+  repeated int32 positionids = 2;
+  repeated int32 block_tables = 3;
+  repeated int32 slot_mapping = 4;
+  repeated int32 seqlens_query = 5;
+  repeated int32 cu_seqlens_query = 6;
+  repeated int32 seqlens_kv = 7;
+  int32 max_seqlens_query = 8;
+  int32 max_seqlens_kv = 9;
+  int32 max_num_blocks_per_seq = 10;
+}
+
+// The Generation response message containing lists of next tokens and seq lens.
+message GenerationResponse {
+  repeated int32 next_tokens = 1;
+  repeated int32 seq_lens = 2;
+}
+
+message InfoRequest {
+  optional int32 empty = 1;
+}
+
+message InfoResponse {
+  int32 num_blocks = 1;
+  int32 block_size = 2;
+}
